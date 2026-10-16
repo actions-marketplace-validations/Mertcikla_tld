@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Routes, Route, Navigate, Outlet, useSearchParams } from 'react-router-dom'
 import { Box, HStack, Spinner, Center } from '@chakra-ui/react'
-import { api } from './api/client'
 import ViewEditor from './pages/ViewEditor'
 import ViewsPage from './pages/Views'
 import Inventory from './pages/Inventory'
@@ -19,6 +18,8 @@ import { initializeTheme, ThemeProvider } from './context/ThemeContext'
 import { platform } from './platform/local'
 import { HomeRedirect } from './components/HomeRedirect'
 import { isWailsApp, isWailsAppStore, isWailsWindows } from './config/runtime'
+import ComparisonScenePage from './pages/ComparisonScene'
+import { useDesktopSceneLinks } from './hooks/useDesktopSceneLinks'
 
 initializeTheme()
 
@@ -81,12 +82,11 @@ function DependenciesRedirect() {
   return <Navigate to={target} replace />
 }
 
-export default function App() {
+function WorkspaceApp() {
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    api.system.ready()
-      .then(() => platform.initPlatform())
+    platform.initPlatform()
       .finally(() => setReady(true))
   }, [])
 
@@ -135,4 +135,13 @@ export default function App() {
       </ConnectorStyleProvider>
       </ThemeProvider>
   )
+}
+
+export default function App() {
+  const ready = useDesktopSceneLinks()
+  if (!ready) return <Center h="var(--app-viewport-height)"><Spinner size="xl" /></Center>
+  return <Routes>
+    <Route path="/compare" element={<ComparisonScenePage />} />
+    <Route path="*" element={<WorkspaceApp />} />
+  </Routes>
 }

@@ -1,9 +1,10 @@
 // src/components/ZUI/useZUIInteraction.ts
 
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
-import type { BBox, DiagramGroupLayout, LayoutNode, ZUITestInteraction, ZUIViewState, HoveredItem } from './types'
+import type { BBox, DiagramGroupLayout, LayoutNode, ZUIObjectSelection, ZUITestInteraction, ZUIViewState, HoveredItem } from './types'
 import { getExpandThresholds, screenToWorldX, screenToWorldY, viewOriginX, viewOriginY, worldToScreenX, worldToScreenY } from './layoutEngine'
-import { hitTestZUIRenderedNode, warmZUIHitTestIndexes } from './hitTest'
+import { hitTestZUIRenderedNode, warmZUIHitTestIndexes, type ZUIHitTestNodeResult } from './hitTest'
+import { getHoverScreenRect, isWithinHoverSafeArea, preserveHoverAnchor } from './hoverFeedback'
 import { buildEdgeSpatialIndex, findHoveredEdge, type EdgeSpatialIndex } from './edgeHover'
 import { isNotchedWheelGesture, wheelZoomFactor, type WheelDeltaLike } from '../../utils/wheel'
 import { safariGestureClientPoint, safariGestureFactor, type SafariGestureEventLike } from '../../utils/safariGesture'
@@ -203,6 +204,7 @@ export interface ZUIInteraction {
   setHoveredItem: (item: HoveredItem | null, force?: boolean) => void
   /** Set to true to prevent clearing hoveredItem while the mouse is over the hover popover. */
   setHoverLocked: (locked: boolean) => void
+  setHoverPopoverElement: (element: HTMLElement | null) => void
 }
 
 export function useZUIInteraction(
@@ -217,9 +219,17 @@ export function useZUIInteraction(
   hiddenTags: string[] = [],
   canvasWidth: number = 0,
   hoverLocked: boolean = false,
+  onSelectObject?: (selection: ZUIObjectSelection | null) => void,
+  onNodeClick?: (hit: ZUIHitTestNodeResult) => void,
 ): ZUIInteraction {
   const [viewState, setViewStateInternal] = useState<ZUIViewState>(initialView)
   const [hoveredItem, setHoveredItemInternal] = useState<HoveredItem | null>(null)
+  const hoveredItemRef = useRef<HoveredItem | null>(null)
+  const nodeHoverAnchorRef = useRef<{ node: LayoutNode; x: number; y: number } | null>(null)
+  const hoverPopoverRef = useRef<HTMLElement | null>(null)
+  const setHoverPopoverElement = useCallback((element: HTMLElement | null) => {
+    hoverPopoverRef.current = element
+  }, [])
   const popoverHoverLockedRef = useRef(false)
   const externalHoverLockedRef = useRef(hoverLocked)
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -227,39 +237,43 @@ export function useZUIInteraction(
     return externalHoverLockedRef.current || popoverHoverLockedRef.current
   }, [])
 
-  const setHoveredItem = useCallback((item: HoveredItem | null, force = false) => {
-    if (hoverTimeoutRef.current) {
-      clearTimeout(hoverTimeoutRef.current)
-      hoverTimeoutRef.current = null
-    }
+  const clearHoverTimeout = useCallback(() => {
+    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current)
+    hoverTimeoutRef.current = null
+  }, [])
 
-    if (item === null) {
-      if (force) {
-        setHoveredItemInternal(null)
-        return
-      }
-      // Grace period before clearing hover to allow mouse to reach popover
+  const setHoveredItem = useCallback((item: HoveredItem | null, force = false) => {
+    if (canvasRef.current) canvasRef.current.style.cursor = item ? 'pointer' : 'grab'
+    if (item === null && !force) {
+      // Start one grace period; repeated moves away should not keep it open forever.
+      if (hoverTimeoutRef.current) return
       hoverTimeoutRef.current = setTimeout(() => {
+        hoverTimeoutRef.current = null
         if (!isHoverLocked()) {
+          hoveredItemRef.current = null
+          nodeHoverAnchorRef.current = null
           setHoveredItemInternal(null)
         }
-      }, 100)
-    } else {
-      setHoveredItemInternal(item)
+      }, 200)
+      return
     }
-  }, [isHoverLocked])
+    clearHoverTimeout()
+    if (item === null) nodeHoverAnchorRef.current = null
+    const next = force ? item : preserveHoverAnchor(hoveredItemRef.current, item)
+    if (next === hoveredItemRef.current) return
+    hoveredItemRef.current = next
+    setHoveredItemInternal(next)
+  }, [canvasRef, clearHoverTimeout, isHoverLocked])
 
   const setHoverLocked = useCallback((locked: boolean) => {
+    const wasLocked = popoverHoverLockedRef.current
     popoverHoverLockedRef.current = locked
     if (locked && hoverTimeoutRef.current) {
       clearTimeout(hoverTimeoutRef.current)
       hoverTimeoutRef.current = null
     }
-    if (!locked) {
-      // If we unlock and there is no item currently being "detected" by mouse,
-      // it should ideally clear soon. The next mouse move will handle it.
-    }
-  }, [])
+    if (!locked && wasLocked) setHoveredItem(null)
+  }, [setHoveredItem])
 
   useEffect(() => {
     externalHoverLockedRef.current = hoverLocked
@@ -269,21 +283,31 @@ export function useZUIInteraction(
     }
   }, [hoverLocked])
 
+  useEffect(() => () => {
+    if (hoverTimeoutRef.current) clearTimeout(hoverTimeoutRef.current)
+  }, [])
+
   // ── Refs for stable event handlers ──────────────────────────────
   const viewStateRef = useRef<ZUIViewState>(initialView)
   const groupsRef = useRef<DiagramGroupLayout[]>(groups)
   const hiddenTagsRef = useRef<ReadonlySet<string>>(new Set(hiddenTags))
   const edgeSpatialIndexRef = useRef<EdgeSpatialIndex | null>(null)
-  if (edgeSpatialIndexRef.current === null) {
-    edgeSpatialIndexRef.current = buildEdgeSpatialIndex(groups)
-  }
+  const edgeSpatialIndex = useMemo(() => buildEdgeSpatialIndex(
+    groups, viewState.zoom, getExpandThresholds(canvasWidth || 1200), new Set(hiddenTags),
+  ), [groups, viewState.zoom, canvasWidth, hiddenTags])
+  edgeSpatialIndexRef.current = edgeSpatialIndex
   const bboxRef = useRef<BBox | undefined>(bbox)
   const onZoomRef = useRef(onZoom)
   const onPanRef = useRef(onPan)
+  const onSelectRef = useRef(onSelectObject)
+  const onNodeClickRef = useRef(onNodeClick)
+  useEffect(() => {
+    onSelectRef.current = onSelectObject
+    onNodeClickRef.current = onNodeClick
+  }, [onSelectObject, onNodeClick])
 
   useEffect(() => {
     groupsRef.current = groups
-    edgeSpatialIndexRef.current = buildEdgeSpatialIndex(groups)
     for (const group of groups) {
       warmZUIHitTestIndexes(group.nodes)
     }
@@ -373,6 +397,7 @@ export function useZUIInteraction(
   }, [])
 
   const dragging = useRef(false)
+  const pointerStart = useRef<{ x: number; y: number } | null>(null)
   const dragButton = useRef<number | null>(null)
   const lastMouse = useRef({ x: 0, y: 0 })
   const lastPointerClient = useRef<{ x: number; y: number } | null>(null)
@@ -493,16 +518,19 @@ export function useZUIInteraction(
     function onMouseDown(e: MouseEvent) {
       if (!isZUIPanMouseButton(e.button)) return
       e.preventDefault()
+      pointerStart.current = e.button === 0 ? { x: e.clientX, y: e.clientY } : null
       dragging.current = true
       dragButton.current = e.button
       lastMouse.current.x = e.clientX
       lastMouse.current.y = e.clientY
       lastPointerClient.current = { x: e.clientX, y: e.clientY }
-      el!.style.cursor = 'grabbing'
       setHoveredItem(null, true) // Hide popover immediately while dragging
+      el!.style.cursor = 'grabbing'
     }
 
     function onMouseMove(e: MouseEvent) {
+      const start = pointerStart.current
+      if (start && Math.hypot(e.clientX - start.x, e.clientY - start.y) > 5) pointerStart.current = null
       const rect = el!.getBoundingClientRect()
       const screenX = e.clientX - rect.left
       const screenY = e.clientY - rect.top
@@ -525,7 +553,39 @@ export function useZUIInteraction(
         return
       }
 
+      const hovered = hoveredItemRef.current
+      const popover = hoverPopoverRef.current
+      let safeAnchor: { x: number; y: number } | null = null
+      if (hovered?.type === 'edge') {
+        safeAnchor = {
+          x: rect.left + worldToScreenX(hovered.absX, viewStateRef.current),
+          y: rect.top + worldToScreenY(hovered.absY, viewStateRef.current),
+        }
+      } else if (hovered?.type === 'node') {
+        const nodeRect = getHoverScreenRect(hovered, viewStateRef.current)!
+        const insideNode = screenX >= nodeRect.sx && screenX <= nodeRect.sx + nodeRect.sw &&
+          screenY >= nodeRect.sy && screenY <= nodeRect.sy + nodeRect.sh
+        // Keep hit-testing inside the card so nested elements remain reachable.
+        // Outside it, protect travel from the last hovered point to the popover.
+        if (!insideNode) {
+          const lastNodePoint = nodeHoverAnchorRef.current
+          safeAnchor = lastNodePoint?.node === hovered.data ? lastNodePoint : {
+            x: rect.left + nodeRect.sx + nodeRect.sw / 2,
+            y: rect.top + nodeRect.sy + nodeRect.sh / 2,
+          }
+        }
+      }
+      if (safeAnchor && popover && isWithinHoverSafeArea(
+        { x: e.clientX, y: e.clientY }, safeAnchor, popover.getBoundingClientRect(),
+      )) {
+        clearHoverTimeout()
+        return
+      }
       if (isHoverLocked()) return
+      if (screenX < 0 || screenY < 0 || screenX > rect.width || screenY > rect.height) {
+        setHoveredItem(null)
+        return
+      }
 
       // Hover detection
       const view = viewStateRef.current
@@ -536,6 +596,7 @@ export function useZUIInteraction(
       const deepest = hitTestZUIRenderedNode(worldX, worldY, groupsRef.current, view, thresholds, hiddenTagsRef.current)
       if (deepest) {
         const { node, absX, absY, absW, absH } = deepest
+        nodeHoverAnchorRef.current = { node, x: e.clientX, y: e.clientY }
         setHoveredItem({
           type: 'node',
           data: node,
@@ -567,14 +628,35 @@ export function useZUIInteraction(
       }
     }
 
-    function onMouseUp() {
+    function selectAt(clientX: number, clientY: number) {
+      if (!onSelectRef.current && !onNodeClickRef.current) return
+      const rect = el!.getBoundingClientRect()
+      const view = viewStateRef.current
+      const x = screenToWorldX(clientX - rect.left, view)
+      const y = screenToWorldY(clientY - rect.top, view)
+      const hit = hitTestZUIRenderedNode(x, y, groupsRef.current, view, getExpandThresholds(rect.width), hiddenTagsRef.current)
+      if (hit) {
+        onSelectRef.current?.({ kind: 'placement', viewId: hit.node.diagramId, resourceId: hit.node.elementId })
+        onNodeClickRef.current?.(hit)
+        return
+      }
+      const edge = resolveHoveredProxyItem?.(x, y, view, rect.width) ?? findHoveredEdge(x, y, edgeSpatialIndexRef.current!, view)
+      if (edge?.type === 'edge' && edge.data.id != null) { onSelectRef.current?.({ kind: 'connector', viewId: edge.data.diagramId, resourceId: edge.data.id }); return }
+      const group = findHoveredGroup(x, y, groupsRef.current, view)
+      onSelectRef.current?.(group ? { kind: 'view', viewId: group.diagramId, resourceId: group.diagramId } : null)
+    }
+
+    function onMouseUp(e: MouseEvent) {
+      const start = pointerStart.current
+      if (start && dragging.current && Math.hypot(e.clientX - start.x, e.clientY - start.y) <= 5) selectAt(e.clientX, e.clientY)
+      pointerStart.current = null
       dragging.current = false
       dragButton.current = null
       if (el) el.style.cursor = 'grab'
     }
 
     function onMouseOut() {
-      setHoveredItem(null)
+      if (!dragging.current) setHoveredItem(null)
     }
 
     function onDblClick(e: MouseEvent) {
@@ -663,12 +745,14 @@ export function useZUIInteraction(
     function onTouchStart(e: TouchEvent) {
       e.preventDefault()
       if (e.touches.length === 1) {
+        pointerStart.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
         dragging.current = true
         lastMouse.current.x = e.touches[0].clientX
         lastMouse.current.y = e.touches[0].clientY
         lastPointerClient.current = { x: e.touches[0].clientX, y: e.touches[0].clientY }
         lastPinchDist.current = null
       } else if (e.touches.length >= 2) {
+        pointerStart.current = null
         dragging.current = false
         const dist = pinchDist(e.touches)
         lastPinchDist.current = dist > 0 ? dist : null
@@ -678,6 +762,9 @@ export function useZUIInteraction(
 
     function onTouchMove(e: TouchEvent) {
       e.preventDefault()
+      const start = pointerStart.current
+      const touch = e.touches[0]
+      if (start && touch && Math.hypot(touch.clientX - start.x, touch.clientY - start.y) > 5) pointerStart.current = null
       setHoveredItem(null, true) // Clear popover immediately on touch movement
       if (e.touches.length === 1 && dragging.current) {
         const dx = e.touches[0].clientX - lastMouse.current.x
@@ -710,6 +797,10 @@ export function useZUIInteraction(
       }
     }
     function onTouchEnd(e: TouchEvent) {
+      const start = pointerStart.current
+      const touch = e.changedTouches[0]
+      if (e.type !== 'touchcancel' && e.touches.length === 0 && start && touch && Math.hypot(touch.clientX - start.x, touch.clientY - start.y) <= 5) selectAt(touch.clientX, touch.clientY)
+      pointerStart.current = null
       if (e.touches.length === 0) {
         dragging.current = false
         lastPinchDist.current = null
@@ -765,7 +856,7 @@ export function useZUIInteraction(
       el.removeEventListener('touchend', onTouchEnd)
       el.removeEventListener('touchcancel', onTouchEnd)
     }
-  }, [canvasRef, scheduleViewState, setViewState, setHoveredItem, isHoverLocked, suppressWheelPan, resolveHoveredProxyItem]) // groupsRef handles groups updates without re-binding!
+  }, [canvasRef, scheduleViewState, setViewState, setHoveredItem, clearHoverTimeout, isHoverLocked, suppressWheelPan, resolveHoveredProxyItem]) // groupsRef handles groups updates without re-binding!
 
-  return { viewState, viewStateRef, setViewState, fitView, maxZoom: dynamicMaxZoom, hoveredItem, setHoveredItem, setHoverLocked }
+  return { viewState, viewStateRef, setViewState, fitView, maxZoom: dynamicMaxZoom, hoveredItem, setHoveredItem, setHoverLocked, setHoverPopoverElement }
 }

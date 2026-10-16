@@ -1,6 +1,9 @@
 import type { ViewLayer } from '../../types'
-import { elementGroupTagForLayer } from '../../utils/elementGroups'
-import type { DiagramGroupLayout, LayoutNode, ZUIViewState } from './types'
+import { elementGroupTagForLayer, isElementGroupTag } from '../../utils/elementGroups'
+import { isGroundingIgnoreTag } from '../../utils/groundingTags'
+import type { DiagramGroupLayout, HoveredItem, LayoutNode, ZUIViewState } from './types'
+import { CHANGE_RING_COLORS } from './changeOverlay'
+import { EDGE_CHANGE_META } from './edgeChange'
 import { positionForHandleSide, stepRoutePoints } from '../../utils/connectorRoute'
 import type { SceneGraph, SceneNode } from './sceneGraph'
 import type { ZUITransitionRebase } from './layoutEngine'
@@ -39,9 +42,21 @@ const MIN_FONT_HINT = 12
 const MAX_FONT_HINT = 24
 
 const VIEW_EDITOR_NODE_H = 85
+const VIEW_EDITOR_NODE_W = 180
 const NAME_FONT_TO_NODE_H = 20 / VIEW_EDITOR_NODE_H
 const TYPE_FONT_TO_NODE_H = 10 / VIEW_EDITOR_NODE_H
 const RADIUS_TO_NODE_H = 8 / VIEW_EDITOR_NODE_H
+const TAG_DOT_TO_NODE_H = 6 / VIEW_EDITOR_NODE_H
+const TAG_DOT_GAP_TO_NODE_H = 4 / VIEW_EDITOR_NODE_H
+const TAG_DOT_INSET_X_TO_NODE_W = 8 / VIEW_EDITOR_NODE_W
+const TAG_DOT_INSET_Y_TO_NODE_H = 8 / VIEW_EDITOR_NODE_H
+const TAG_OVERFLOW_FONT_TO_NODE_H = 8 / VIEW_EDITOR_NODE_H
+const BADGE_H_TO_NODE_H = 16 / VIEW_EDITOR_NODE_H
+const BADGE_FONT_TO_NODE_H = 10 / VIEW_EDITOR_NODE_H
+const BADGE_PAD_TO_NODE_H = 6 / VIEW_EDITOR_NODE_H
+const BADGE_GAP_TO_NODE_H = 5 / VIEW_EDITOR_NODE_H
+const BADGE_RADIUS_TO_NODE_H = 5 / VIEW_EDITOR_NODE_H
+const BADGE_MIN_SCREEN_H = 12
 
 export interface ScreenRect {
   left: number
@@ -149,6 +164,7 @@ export interface RenderContext {
   thresholds: { start: number; end: number }
   lowDetail: boolean
   groupLayersByDiagram: Map<number, ViewLayer[]>
+  hoveredItem?: HoveredItem | null
 }
 
 const imageCache = new Map<string, HTMLImageElement>()
@@ -163,9 +179,37 @@ export function setHighlightedTags(tags: Set<string>): void {
   currentHighlightedTags = tags
 }
 
-let currentHighlightColor = ''
-export function setHighlightColor(color: string): void {
-  currentHighlightColor = color
+export function setHighlightColor(_color: string): void {
+  // Retained for API compatibility; per-tag colors now drive pill chrome.
+}
+
+let currentTagColors: Record<string, string> = {}
+export function setTagColors(colors: Record<string, { color?: string } | string>): void {
+  const next: Record<string, string> = {}
+  for (const [name, entry] of Object.entries(colors ?? {})) {
+    if (typeof entry === 'string') {
+      if (entry) next[name] = entry
+    } else if (entry?.color) {
+      next[name] = entry.color
+    }
+  }
+  currentTagColors = next
+}
+
+function tagColorFor(tag: string, fallback: string): string {
+  return currentTagColors[tag] || fallback
+}
+
+/** Visible workspace tags for node chrome: mirrors ViewEditor's ElementNode filter. */
+function visibleNodeTags(tags: string[]): string[] {
+  return (tags ?? []).filter(
+    (tag) => !isElementGroupTag(tag) && !isGroundingIgnoreTag(tag),
+  )
+}
+
+function isTagHighlighted(visibleTags: string[]): boolean {
+  if (currentHighlightedTags.size === 0 || visibleTags.length === 0) return false
+  return visibleTags.some((tag) => currentHighlightedTags.has(tag))
 }
 
 // A node stays fully opaque when it or any descendant carries a change overlay,
@@ -549,20 +593,35 @@ function drawCycleIcon(ctx: CanvasRenderingContext2D, x: number, y: number, size
   ctx.restore()
 }
 
-function unitVector(fromX: number, fromY: number, toX: number, toY: number): { x: number; y: number; len: number } {
-  const dx = toX - fromX
-  const dy = toY - fromY
-  const len = Math.hypot(dx, dy)
-  if (len <= 0) return { x: 0, y: 0, len: 0 }
-  return { x: dx / len, y: dy / len, len }
-}
+function clipConnectorTip(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, size: number): void {
+  const transform = ctx.getTransform()
+  const cos = Math.cos(angle)
+  const sin = Math.sin(angle)
+  const halfWidth = size * 0.6 + ctx.lineWidth / 2
+  const front = ctx.lineWidth / 2
+  const mask = new Path2D()
+  mask.rect(0, 0, ctx.canvas.width, ctx.canvas.height)
 
-function trimDelta(x: number, y: number, towardX: number, towardY: number, dist: number): { dx: number; dy: number } {
-  if (dist <= 0) return { dx: 0, dy: 0 }
-  const u = unitVector(x, y, towardX, towardY)
-  if (u.len <= 0) return { dx: 0, dy: 0 }
-  const d = Math.min(dist, u.len * 0.9)
-  return { dx: u.x * d, dy: u.y * d }
+  // Stop the stroke at the arrow's base without changing the underlying route.
+  const corners = [
+    [-size * 1.6, -halfWidth],
+    [front, -halfWidth],
+    [front, halfWidth],
+    [-size * 1.6, halfWidth],
+  ]
+  corners.forEach(([along, across], index) => {
+    const localX = x + along * cos - across * sin
+    const localY = y + along * sin + across * cos
+    const screenX = transform.a * localX + transform.c * localY + transform.e
+    const screenY = transform.b * localX + transform.d * localY + transform.f
+    if (index === 0) mask.moveTo(screenX, screenY)
+    else mask.lineTo(screenX, screenY)
+  })
+  mask.closePath()
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.clip(mask, 'evenodd')
+  ctx.setTransform(transform)
 }
 
 function drawArrowHead(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, size: number, color: string): void {
@@ -793,6 +852,7 @@ function drawSceneNode(
   const parentAlpha = state.parentAlpha
   const inheritedAlpha = state.inheritedAlpha
 
+  const isHovered = renderCtx.hoveredItem?.type === 'node' && renderCtx.hoveredItem.data === layout
   const borderColor = typeBorderColor(layout.type)
 
   const traceShape = (ox = 0, oy = 0) => {
@@ -894,10 +954,10 @@ function drawSceneNode(
     traceShape()
     if (layout.isPortal) {
       ctx.strokeStyle = accent
-      ctx.lineWidth = 1 / drawZoom
+      ctx.lineWidth = (isHovered ? 1.5 : 1) / drawZoom
       ctx.setLineDash([])
     } else {
-      ctx.strokeStyle = borderColor
+      ctx.strokeStyle = isHovered ? accent : borderColor
       ctx.lineWidth = 1.5 / drawZoom
       if (t > 0.15) {
         const dashLen = 6
@@ -1032,63 +1092,123 @@ function drawSceneNode(
     ctx.restore()
   }
 
-  if (currentHighlightedTags.size > 0 && parentAlpha > 0.05) {
-    const isHighlighted = layout.tags.length > 0 && layout.tags.some((t2) => currentHighlightedTags.has(t2))
-    if (isHighlighted) {
-      const glowColor = currentHighlightColor || accent
-      ctx.save()
-      ctx.globalAlpha = parentAlpha
-      ctx.shadowColor = glowColor
-      ctx.shadowBlur = 8 / drawZoom
-      ctx.strokeStyle = glowColor
-      ctx.lineWidth = 2.5 / drawZoom
-      ctx.setLineDash([])
-      traceShape()
-      ctx.stroke()
-      ctx.shadowBlur = 0
-      ctx.restore()
-    } else if (!subtreeHasChangeOverlay(layout)) {
-      // Nodes inside a change overlay subtree (direct impact or blast-radius
-      // context) stay fully opaque; only unrelated elements fade into the
-      // background.
-      ctx.save()
-      ctx.globalAlpha = parentAlpha * 0.82
-      ctx.fillStyle = canvasBg
-      traceShape()
-      ctx.fill()
-      ctx.restore()
+  // ViewEditor-style tag chrome (replaces the old glow+dim highlight):
+  // idle = tag-colored dots bottom-left; element or tag-menu hover = vertical
+  // stack of pills (color dot + name).
+  {
+    const tags = visibleNodeTags(layout.tags)
+    if (tags.length > 0 && parentAlpha > 0.05) {
+      const highlighted = isTagHighlighted(tags)
+      if ((isHovered || highlighted) && !renderCtx.lowDetail && drawScreenW > 90 && parentAlpha > 0.1) {
+        // Scale chips gently with the visible card, and keep them clear of its
+        // rounded corners even when the card is much larger than the editor size.
+        const chipScale = clamp(h * drawZoom / VIEW_EDITOR_NODE_H, 1, 1.6)
+        const chipUnit = chipScale / drawZoom
+        const insetX = Math.max(w * TAG_DOT_INSET_X_TO_NODE_W, 6 * chipUnit)
+        const insetY = Math.max(h * TAG_DOT_INSET_Y_TO_NODE_H, 6 * chipUnit)
+        const pillH = 18 * chipUnit
+        const pillGap = 4 * chipUnit
+        const pillPadX = 8 * chipUnit
+        const dotR = 3 * chipUnit
+        const fontSize = 10 * chipUnit
+        ctx.save()
+        ctx.font = `700 ${fontSize}px ${ZUI_FONT_FAMILY}`
+        ctx.textAlign = 'left'
+        ctx.textBaseline = 'middle'
+        const pillWidths = tags.map((tag) => {
+          const textW = ctx.measureText(tag).width
+          return pillPadX * 2 + dotR * 2 + 4 * chipUnit + textW
+        })
+        let pillBottom = y + h - insetY
+        for (let i = 0; i < tags.length; i += 1) {
+          const tag = tags[i]
+          const pillW = Math.min(pillWidths[i], w - insetX * 2)
+          const pillX = x + insetX
+          const pillY = pillBottom - pillH
+          if (pillY < y + insetY) break
+          ctx.globalAlpha = parentAlpha
+          ctx.beginPath()
+          ctx.roundRect(pillX, pillY, pillW, pillH, pillH / 2)
+          ctx.fillStyle = renderCtx.labelBg
+          ctx.fill()
+          ctx.strokeStyle = 'rgba(255,255,255,0.3)'
+          ctx.lineWidth = 1 / drawZoom
+          ctx.stroke()
+          const dotCX = pillX + pillPadX + dotR
+          const dotCY = pillY + pillH / 2
+          ctx.beginPath()
+          ctx.arc(dotCX, dotCY, dotR, 0, Math.PI * 2)
+          ctx.fillStyle = tagColorFor(tag, accent)
+          ctx.fill()
+          ctx.fillStyle = '#fff'
+          const textX = dotCX + dotR + 4 * chipUnit
+          ctx.fillText(tag, textX, dotCY + 0.5 / drawZoom, Math.max(0, pillW - (textX - pillX) - pillPadX))
+          pillBottom = pillY - pillGap
+        }
+        ctx.restore()
+      } else if (drawScreenW > 50) {
+        const dotD = h * TAG_DOT_TO_NODE_H
+        const dotR = dotD / 2
+        const gap = h * TAG_DOT_GAP_TO_NODE_H
+        const insetX = w * TAG_DOT_INSET_X_TO_NODE_W
+        const insetY = h * TAG_DOT_INSET_Y_TO_NODE_H
+        const maxDots = 5
+        const shown = tags.slice(0, maxDots)
+        ctx.save()
+        ctx.globalAlpha = parentAlpha
+        shown.forEach((tag, i) => {
+          const cx = x + insetX + dotR + i * (dotD + gap)
+          const cy = y + h - insetY - dotR
+          ctx.beginPath()
+          ctx.arc(cx, cy, dotR, 0, Math.PI * 2)
+          ctx.fillStyle = tagColorFor(tag, accent)
+          ctx.fill()
+        })
+        if (tags.length > maxDots) {
+          ctx.font = `700 ${h * TAG_OVERFLOW_FONT_TO_NODE_H}px ${ZUI_FONT_FAMILY}`
+          ctx.fillStyle = 'rgba(255,255,255,0.6)'
+          ctx.textAlign = 'left'
+          ctx.textBaseline = 'middle'
+          ctx.fillText(
+            `+${tags.length - maxDots}`,
+            x + insetX + dotR + maxDots * (dotD + gap),
+            y + h - insetY - dotR,
+          )
+        }
+        ctx.restore()
+      }
     }
   }
 
-
-  // Blast-radius context keeps its grey marker internally for opacity, but is
-  // not drawn: neighbours should look exactly like the original canvas.
+  // Change state reads as a single solid ring color-coded by line change.
+  // Everything else (provenance, blast-radius context) reads through tags —
+  // except modified, which carries its +added/−removed lines badge instead.
   if (layout.changeOverlay && layout.changeOverlay.change !== 'unchanged' && parentAlpha > 0.05) {
     const change = layout.changeOverlay
-    const color = { added: '#48bb78', removed: '#fc8181', modified: '#ecc94b', unchanged: '#718096' }[change.change]
+    const color = CHANGE_RING_COLORS[change.change]
     ctx.save()
     ctx.globalAlpha = parentAlpha
     ctx.strokeStyle = color
     ctx.lineWidth = 2.5 / drawZoom
-    ctx.setLineDash(change.change === 'removed' ? [5 / drawZoom, 3 / drawZoom] : [])
+    ctx.setLineDash([])
     traceShape()
     ctx.stroke()
-    if (change.change !== 'unchanged' && drawScreenW > 70 && !renderCtx.lowDetail) {
-      const plus = `+${change.linesAdded ?? 0}`
-      const minus = `\u2212${change.linesRemoved ?? 0}`
-      const badgePad = 6 / drawZoom
-      const padX = 6 / drawZoom
-      const gap = 5 / drawZoom
-      const badgeH = 16 / drawZoom
-      ctx.font = `600 ${10 / drawZoom}px ${ZUI_FONT_FAMILY}`
+    if (change.change === 'modified' && change.linesAdded != null && change.linesRemoved != null && !renderCtx.lowDetail && h * BADGE_H_TO_NODE_H * drawZoom >= BADGE_MIN_SCREEN_H) {
+      const plus = `+${change.linesAdded}`
+      const minus = `\u2212${change.linesRemoved}`
+      const badgePad = h * BADGE_PAD_TO_NODE_H
+      const padX = h * BADGE_PAD_TO_NODE_H
+      const gap = h * BADGE_GAP_TO_NODE_H
+      const badgeH = h * BADGE_H_TO_NODE_H
+      ctx.font = `600 ${h * BADGE_FONT_TO_NODE_H}px ${ZUI_FONT_FAMILY}`
       const plusW = ctx.measureText(plus).width
       const minusW = ctx.measureText(minus).width
       const badgeW = Math.min(plusW + gap + minusW + padX * 2, w - badgePad * 2)
-      const badgeX = x
-      const badgeY = y + h + badgePad
+      const badgeX = x + w - badgeW
+      const badgeY = y + h + badgeH - badgePad
       ctx.setLineDash([])
       ctx.beginPath()
-      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, 5 / drawZoom)
+      ctx.roundRect(badgeX, badgeY, badgeW, badgeH, h * BADGE_RADIUS_TO_NODE_H)
       ctx.fillStyle = portalTintColor(color, 0.22)
       ctx.fill()
       ctx.strokeStyle = color
@@ -1233,6 +1353,7 @@ function drawEdges(
   lowDetail: boolean,
   originX?: number,
   originY?: number,
+  hoveredItem?: HoveredItem | null,
 ): void {
   if (alpha < 0.05) return
 
@@ -1319,7 +1440,13 @@ function drawEdges(
       ctx.save()
       ctx.globalAlpha = connectorAlpha(edgeAlpha * layerFactor, CONNECTOR_MIN_ALPHA * endpointAlphaFactor * layerFactor)
       ctx.strokeStyle = strokeColor
-      ctx.lineWidth = CONNECTOR_LINE_PX / zoom
+      const isHovered = hoveredItem?.type === 'edge' && !hoveredItem.data.isProxy &&
+        hoveredItem.data.id === edge.id && hoveredItem.data.diagramId === node.diagramId
+      ctx.lineWidth = (isHovered ? 4 : CONNECTOR_LINE_PX) / zoom
+
+      if (edge.change === 'removed') {
+        ctx.setLineDash(EDGE_CHANGE_META.removed.dash.map((segment) => segment / zoom))
+      }
 
       let midX = (sH.x + tH.x) / 2
       let midY = (sH.y + tH.y) / 2
@@ -1335,9 +1462,9 @@ function drawEdges(
       const drawSourceArrow = (dir === 'backward' || dir === 'both' || dir === 'bidirectional') && sourceConnectorDetailVisible
       const targetArrowSize = Math.min(ARROW_SIZE_BASE, visualTargetScreenW * 0.2) / zoom
       const sourceArrowSize = Math.min(ARROW_SIZE_BASE, visualSourceScreenW * 0.2) / zoom
-      const targetTrim = drawTargetArrow ? targetArrowSize * 1.6 : 0
-      const sourceTrim = drawSourceArrow ? sourceArrowSize * 1.6 : 0
 
+      // Keep route geometry independent of arrow visibility.
+      const connectorPath = new Path2D()
       if (type === 'bezier') {
         const curvature = 0.5
         let cp1x = sH.x, cp1y = sH.y, cp2x = tH.x, cp2y = tH.y
@@ -1368,33 +1495,21 @@ function drawEdges(
         finalAngleT = Math.atan2(tH.y - cp2y, tH.x - cp2x)
         finalAngleS = Math.atan2(sH.y - cp1y, sH.x - cp1x)
 
-        const endDelta = trimDelta(tH.x, tH.y, cp2x, cp2y, targetTrim)
-        const startDelta = trimDelta(sH.x, sH.y, cp1x, cp1y, sourceTrim)
-
-        ctx.beginPath()
-        ctx.moveTo(sH.x + startDelta.dx, sH.y + startDelta.dy)
-        ctx.bezierCurveTo(
-          cp1x + startDelta.dx,
-          cp1y + startDelta.dy,
-          cp2x + endDelta.dx,
-          cp2y + endDelta.dy,
-          tH.x + endDelta.dx,
-          tH.y + endDelta.dy,
+        connectorPath.moveTo(sH.x, sH.y)
+        connectorPath.bezierCurveTo(
+          cp1x,
+          cp1y,
+          cp2x,
+          cp2y,
+          tH.x,
+          tH.y,
         )
-        ctx.stroke()
-
       } else if (type === 'straight') {
         finalAngleT = Math.atan2(tH.y - sH.y, tH.x - sH.x)
         finalAngleS = Math.atan2(sH.y - tH.y, sH.x - tH.x)
 
-        const { x: ux, y: uy, len } = unitVector(sH.x, sH.y, tH.x, tH.y)
-        const startTrim = Math.min(sourceTrim, len * 0.45)
-        const endTrim = Math.min(targetTrim, len * 0.45)
-
-        ctx.beginPath()
-        ctx.moveTo(sH.x + ux * startTrim, sH.y + uy * startTrim)
-        ctx.lineTo(tH.x - ux * endTrim, tH.y - uy * endTrim)
-        ctx.stroke()
+        connectorPath.moveTo(sH.x, sH.y)
+        connectorPath.lineTo(tH.x, tH.y)
 
       } else if (type === 'step' || type === 'smoothstep') {
         const borderRadius = type === 'smoothstep' ? 6 / zoom : 0
@@ -1440,19 +1555,12 @@ function drawEdges(
         finalAngleS = Math.atan2(first.y - firstNext.y, first.x - firstNext.x)
         finalAngleT = Math.atan2(last.y - lastPrev.y, last.x - lastPrev.x)
 
-        const linePoints = points.slice()
-        const startDelta = trimDelta(first.x, first.y, firstNext.x, firstNext.y, sourceTrim)
-        const endDelta = trimDelta(last.x, last.y, lastPrev.x, lastPrev.y, targetTrim)
-        linePoints[0] = { x: first.x + startDelta.dx, y: first.y + startDelta.dy }
-        linePoints[linePoints.length - 1] = { x: last.x + endDelta.dx, y: last.y + endDelta.dy }
+        connectorPath.moveTo(first.x, first.y)
 
-        ctx.beginPath()
-        ctx.moveTo(linePoints[0].x, linePoints[0].y)
-
-        for (let i = 1; i < linePoints.length; i++) {
-          const curr = linePoints[i]
-          const prev = linePoints[i - 1]
-          const next = linePoints[i + 1]
+        for (let i = 1; i < points.length; i++) {
+          const curr = points[i]
+          const prev = points[i - 1]
+          const next = points[i + 1]
 
           if (borderRadius > 0 && next) {
             const dPrevX = curr.x - prev.x
@@ -1460,20 +1568,25 @@ function drawEdges(
             const dPrevLen = Math.sqrt(dPrevX * dPrevX + dPrevY * dPrevY)
             const r = Math.min(borderRadius, dPrevLen / 2)
 
-            ctx.lineTo(curr.x - (dPrevX / dPrevLen) * r, curr.y - (dPrevY / dPrevLen) * r)
+            connectorPath.lineTo(curr.x - (dPrevX / dPrevLen) * r, curr.y - (dPrevY / dPrevLen) * r)
 
             const dNextX = next.x - curr.x
             const dNextY = next.y - curr.y
             const dNextLen = Math.sqrt(dNextX * dNextX + dNextY * dNextY)
             const rNext = Math.min(borderRadius, dNextLen / 2)
 
-            ctx.arcTo(curr.x, curr.y, curr.x + (dNextX / dNextLen) * rNext, curr.y + (dNextY / dNextLen) * rNext, r)
+            connectorPath.arcTo(curr.x, curr.y, curr.x + (dNextX / dNextLen) * rNext, curr.y + (dNextY / dNextLen) * rNext, r)
           } else {
-            ctx.lineTo(curr.x, curr.y)
+            connectorPath.lineTo(curr.x, curr.y)
           }
         }
-        ctx.stroke()
       }
+
+      ctx.save()
+      if (drawTargetArrow) clipConnectorTip(ctx, tH.x, tH.y, finalAngleT, targetArrowSize)
+      if (drawSourceArrow) clipConnectorTip(ctx, sH.x, sH.y, finalAngleS, sourceArrowSize)
+      ctx.stroke(connectorPath)
+      ctx.restore()
 
       if (drawTargetArrow) {
         drawArrowHead(ctx, tH.x, tH.y, finalAngleT, targetArrowSize, strokeColor)
@@ -1570,7 +1683,7 @@ function drawNodeTree(
           renderCtx.lowDetail,
         )
       }
-      drawEdges(ctx, node.children, node.state.childAlpha * 0.8, childZoom, renderCtx.thresholds, renderCtx.accent, renderCtx.labelBg, occupiedLabelRects, renderCtx.lowDetail)
+      drawEdges(ctx, node.children, node.state.childAlpha * 0.8, childZoom, renderCtx.thresholds, renderCtx.accent, renderCtx.labelBg, occupiedLabelRects, renderCtx.lowDetail, undefined, undefined, renderCtx.hoveredItem)
     }
 
     for (const child of node.children) {
@@ -1644,7 +1757,7 @@ export function renderFrame(
       renderCtx.lowDetail,
     )
 
-    drawEdges(ctx, group.nodes, 0.7, renderView.zoom, renderCtx.thresholds, accent, renderCtx.labelBg, occupiedLabelRects, renderCtx.lowDetail, rebase.originX, rebase.originY)
+    drawEdges(ctx, group.nodes, 0.7, renderView.zoom, renderCtx.thresholds, accent, renderCtx.labelBg, occupiedLabelRects, renderCtx.lowDetail, rebase.originX, rebase.originY, renderCtx.hoveredItem)
 
     for (const node of group.nodes) {
       if (!node.state.isVisible) continue

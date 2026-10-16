@@ -27,7 +27,11 @@ vi.mock('@chakra-ui/react', async () => {
     Popover: BoxLike,
     PopoverArrow: BoxLike,
     PopoverBody: BoxLike,
-    PopoverContent: ({ children, ...props }: { children?: React.ReactNode }) => ReactModule.createElement('div', { 'data-testid': 'zui-popover-content', ...props }, children),
+    PopoverContent: ReactModule.forwardRef<HTMLDivElement, { children?: React.ReactNode }>(function MockPopoverContent({ children, ...props }, ref) {
+      // Match the motion component retaining its initial forwarded ref.
+      const initialRef = ReactModule.useRef(ref)
+      return ReactModule.createElement('div', { 'data-testid': 'zui-popover-content', ...props, ref: initialRef.current }, children)
+    }),
     PopoverHeader: BoxLike,
     PopoverTrigger: BoxLike,
     Portal: BoxLike,
@@ -75,7 +79,6 @@ function hoveredNode(): HoveredItem {
     absH: 80,
   }
 }
-
 function renderPopover(open: boolean, onHoverLock: (locked: boolean) => void) {
   return (
     <ZUIHoverPopover
@@ -104,5 +107,92 @@ describe('ZUIHoverPopover hover lock', () => {
     })
 
     expect(onHoverLock).toHaveBeenLastCalledWith(false)
+  })
+})
+
+describe('ZUIHoverPopover provenance', () => {
+  it('renders no provenance row: provenance reads through tags now', () => {
+    const item = hoveredNode()
+    if (item.type !== 'node') throw new Error('expected a node hover target')
+    item.data = {
+      ...item.data,
+      tags: [...item.data.tags, 'augmented'],
+      changeOverlay: { change: 'modified', path: 'new.go', symbols: [], reason: 'direct' },
+    }
+    const renderer = create(
+      <ZUIHoverPopover
+        hoveredItem={item}
+        hoveredScreenRect={{ sx: 0, sy: 0, sw: 100, sh: 80 }}
+        isHoveredItemFullyVisible
+        onHoverLock={() => {}}
+      />,
+    )
+    expect(renderer.root.findAllByProps({ 'data-testid': 'zui-provenance-details' })).toHaveLength(0)
+    expect(renderer.root.findAllByProps({ 'data-testid': 'zui-change-details' }).length).toBeGreaterThanOrEqual(1)
+  })
+})
+
+describe('ZUIHoverPopover edge change', () => {
+  it('badges edges new in the diff', () => {
+    const renderer = create(
+      <ZUIHoverPopover
+        hoveredItem={{
+          type: 'edge',
+          data: {
+            sourceId: 'a', targetId: 'b', label: 'calls', diagramId: 1,
+            change: 'added',
+          },
+          absX: 0, absY: 0,
+        }}
+        hoveredScreenRect={{ sx: 0, sy: 0, sw: 100, sh: 80 }}
+        isHoveredItemFullyVisible
+        onHoverLock={() => {}}
+      />,
+    )
+    expect(renderer.root.findAllByProps({ 'data-testid': 'zui-edge-change' }).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('shows no badge for unchanged edges', () => {
+    const renderer = create(
+      <ZUIHoverPopover
+        hoveredItem={{
+          type: 'edge',
+          data: { sourceId: 'a', targetId: 'b', label: 'calls', diagramId: 1 },
+          absX: 0, absY: 0,
+        }}
+        hoveredScreenRect={{ sx: 0, sy: 0, sw: 100, sh: 80 }}
+        isHoveredItemFullyVisible
+        onHoverLock={() => {}}
+      />,
+    )
+    expect(renderer.root.findAllByProps({ 'data-testid': 'zui-edge-change' })).toHaveLength(0)
+  })
+})
+
+
+describe('ZUIHoverPopover safe corridor bounds', () => {
+  it('reports the mounted content when opening without replacing its forwarded ref', () => {
+    const onPopoverElement = vi.fn()
+    const onHoverLock = vi.fn()
+    const element = {} as HTMLDivElement
+    const render = (open: boolean) => (
+      <ZUIHoverPopover
+        hoveredItem={open ? hoveredNode() : null}
+        hoveredScreenRect={open ? { sx: 0, sy: 0, sw: 100, sh: 80 } : null}
+        isHoveredItemFullyVisible={open}
+        onHoverLock={onHoverLock}
+        onPopoverElement={onPopoverElement}
+      />
+    )
+    const renderer = create(render(false), { createNodeMock: () => element })
+    expect(onPopoverElement).toHaveBeenLastCalledWith(null)
+    act(() => { renderer.update(render(true)) })
+    expect(onPopoverElement).toHaveBeenLastCalledWith(element)
+    act(() => { renderer.update(render(false)) })
+    expect(onPopoverElement).toHaveBeenLastCalledWith(null)
+    act(() => { renderer.update(render(true)) })
+    expect(onPopoverElement).toHaveBeenLastCalledWith(element)
+    act(() => { renderer.unmount() })
+    expect(onPopoverElement).toHaveBeenLastCalledWith(null)
   })
 })

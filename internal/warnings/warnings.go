@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/mertcikla/tld/v2/internal/ignore"
 	"github.com/mertcikla/tld/v2/internal/tech"
 	"github.com/mertcikla/tld/v2/internal/workspace"
 )
@@ -39,6 +40,24 @@ type WarningScore struct {
 	Ignored   int
 	Reasoning []string
 	Views     []ViewScore
+	// Repos is populated by ARC206 with the per-repository coverage of the
+	// indexed directories by source-linked elements.
+	Repos []RepoCoverage
+	// Excluded is populated by ARC206 with the number of indexed files the
+	// workspace exclude rules drop from the coverage denominator.
+	Excluded int
+}
+
+// LinkedRepository describes an indexed codeindex repository that workspace
+// elements can link to, together with the files it contains.
+type LinkedRepository struct {
+	ID        string
+	Name      string
+	Root      string
+	RemoteURL string
+	// Paths are the repository's indexed files, relative to its root and
+	// slash-separated.
+	Paths []string
 }
 
 // GroundingElement is a per-element view of the source grounding state. It is
@@ -89,6 +108,22 @@ type warningRule struct {
 }
 
 var warningRules = []warningRule{
+	{
+		Code:        "ARC008",
+		Name:        "Unresolved Connector",
+		Description: "Connector references a missing endpoint definition",
+		Mediation:   "Define the missing element or correct the endpoint ref. Existing endpoints in other views are valid off-view relationships.",
+		Level:       1,
+		Check: func(ctx *warningContext, rule warningRule) {
+			for _, view := range ctx.ws.ViewDiagnostics() {
+				for _, key := range view.UnresolvedConnectors {
+					for _, ref := range view.ConnectorVisibility[key].MissingEndpoints {
+						ctx.addWarning(rule.Code, fmt.Sprintf("Connector %q: endpoint %q has no element definition", key, ref))
+					}
+				}
+			}
+		},
+	},
 	{
 		Code:        "ARC001",
 		Name:        "High Density",
@@ -157,13 +192,23 @@ var warningRules = []warningRule{
 		Mediation:   "Create nested views to establish a zoomable hierarchy.",
 		Level:       1,
 		Check: func(ctx *warningContext, rule warningRule) {
-			viewCount := 0
+			elementCount := 0
 			for _, element := range ctx.ws.Elements {
-				if element != nil && element.HasView {
-					viewCount++
+				if element == nil {
+					continue
+				}
+				elementCount++
+				if element.HasView {
+					// Placing a view owner creates a drilldown from its parent
+					// view, including when that parent is the workspace root.
+					if len(element.Placements) > 0 {
+						return
+					}
 				}
 			}
-			if ctx.maxDepth < 1 && viewCount > 1 {
+			// A nontrivial diagram with no drilldowns is flat, even when
+			// it has only the implicit workspace view.
+			if elementCount > 1 {
 				ctx.addWarning(rule.Code, "Workspace views")
 			}
 		},
@@ -237,14 +282,7 @@ var warningRules = []warningRule{
 				if element == nil {
 					continue
 				}
-				isRootLevel := len(element.Placements) == 0
-				for _, placement := range element.Placements {
-					if normalizeWarningViewRef(placement.ParentRef) == syntheticRootViewRef {
-						isRootLevel = true
-						break
-					}
-				}
-				if isRootLevel {
+				if ctx.ws.ElementPlacedInView(elementRef, syntheticRootViewRef) {
 					lowerType := strings.ToLower(element.Kind)
 					if lowerType == "function" || lowerType == "class" {
 						ctx.addWarning(rule.Code, fmt.Sprintf("Element %q (Kind: %s)", elementRef, element.Kind))
@@ -267,24 +305,6 @@ var warningRules = []warningRule{
 						continue
 					}
 					ctx.addWarning(rule.Code, fmt.Sprintf("%q", elementRef))
-				}
-			}
-		},
-	},
-	{
-		Code:        "ARC103",
-		Name:        "Unknown Technology",
-		Description: "Catalog mismatch",
-		Mediation:   "Use recognized technology names (e.g. Go, React) or double check spelling.",
-		Level:       2,
-		Check: func(ctx *warningContext, rule warningRule) {
-			for elementRef, element := range ctx.ws.Elements {
-				if element == nil || element.Technology == "" {
-					continue
-				}
-				missing := tech.Validate(element.Technology)
-				if len(missing) > 0 {
-					ctx.addWarning(rule.Code, fmt.Sprintf("Element %q has unknown: %s", elementRef, strings.Join(missing, ", ")))
 				}
 			}
 		},
@@ -424,6 +444,44 @@ var warningRules = []warningRule{
 					continue
 				}
 				ctx.addWarning(rule.Code, fmt.Sprintf("View %q is %d/%d grounded (score %d/10)", view.ViewRef, view.Grounded, view.Eligible, view.Value))
+			}
+		},
+	},
+	{
+		Code:        "ARC206",
+		Name:        "Low Link Coverage",
+		Description: "Linked elements do not cover the indexed code directories",
+		Mediation:   "Link elements to files in the uncovered directories, e.g. `tld link <element> --file <path>`, so change tracking reaches the whole codebase.",
+		Level:       3,
+		Check: func(ctx *warningContext, rule warningRule) {
+			report := ctx.linkCoverageReport()
+			if report.Eligible == 0 {
+				return
+			}
+			ctx.scores[rule.Code] = &report
+			for _, repo := range report.Repos {
+				if repo.Total == 0 || repo.Percent >= ctx.linkCoverageMin {
+					continue
+				}
+				ctx.addWarning(rule.Code, linkCoverageViolation(repo))
+			}
+		},
+	},
+	{
+		Code:        "ARC207",
+		Name:        "Unknown Technology",
+		Description: "Catalog mismatch",
+		Mediation:   "Use recognized technology names (e.g. Go, React) or double check spelling.",
+		Level:       2,
+		Check: func(ctx *warningContext, rule warningRule) {
+			for elementRef, element := range ctx.ws.Elements {
+				if element == nil || element.Technology == "" {
+					continue
+				}
+				missing := tech.Validate(element.Technology)
+				if len(missing) > 0 {
+					ctx.addWarning(rule.Code, fmt.Sprintf("Element %q has unknown: %s", elementRef, strings.Join(missing, ", ")))
+				}
 			}
 		},
 	},
@@ -754,8 +812,10 @@ type warningContext struct {
 	viewElements        map[string][]string
 	elementViews        map[string]map[string]int
 	viewConnectors      map[string]int
-	maxDepth            int
 	codeindexClassifier func(*workspace.Element) bool
+	linkTargets         []LinkedRepository
+	linkCoverageMin     int
+	ignoreRules         *ignore.Rules
 }
 
 // isCodeindexElement reports whether the element was materialized from the
@@ -834,6 +894,7 @@ func newWarningContext(ws *workspace.Workspace, opts ...Option) *warningContext 
 		viewElements:    make(map[string][]string),
 		elementViews:    make(map[string]map[string]int),
 		viewConnectors:  make(map[string]int),
+		linkCoverageMin: linkCoverageThreshold(ws),
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -896,21 +957,10 @@ func (ctx *warningContext) prepareData() {
 			elementViews[viewRef]++
 		}
 	}
-
-	ctx.calculateMaxDepth()
 }
 
-func (ctx *warningContext) calculateMaxDepth() {
-	for _, depth := range ctx.viewDepthMap() {
-		if depth > ctx.maxDepth {
-			ctx.maxDepth = depth
-		}
-	}
-}
-
-// viewDepthMap returns the nesting depth of every view-owning element, using
-// the same scheme as ARC004: a top-level view is 0 and each nested level adds 1.
-// The synthetic root is implicit at 0.
+// viewDepthMap returns the placement depth of every view-owning element:
+// an owner in the root is at 0 and each nested level adds 1.
 func (ctx *warningContext) viewDepthMap() map[string]int {
 	memo := make(map[string]int)
 	visiting := make(map[string]bool)

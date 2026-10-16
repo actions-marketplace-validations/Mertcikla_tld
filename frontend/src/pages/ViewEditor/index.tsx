@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import type { CoreUISlots } from '../../slots'
+import { resetTagFilters, toggleHiddenTags, toggleSelectedTag } from '../../utils/tagFilters'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { parseNumericId } from '../../utils/ids'
 import { copyTextToClipboard } from '../../utils/clipboard'
@@ -62,6 +63,7 @@ import CodePreviewPanel from '../../components/CodePreviewPanel'
 import ConnectorPanel from '../../components/ConnectorPanel'
 import ConnectorPanelCollaboration from '../../components/ConnectorPanelCollaboration'
 import ElementLibrary from '../../components/ElementInventory'
+import { usePanelStyle } from '../../context/ThemeContext'
 import ViewExplorer from '../../components/ViewExplorer'
 import ViewMarkdownPanel from '../../components/ViewMarkdownPanel'
 import ViewPanel from '../../components/ViewPanel'
@@ -157,7 +159,7 @@ import {
 import { isGroundingIgnoreTag } from '../../utils/groundingTags'
 import { overrideViewContentInSnapshot } from '../../crossBranch/graph'
 import { useCrossBranchContextSettings } from '../../crossBranch/settings'
-import { removeConnectorGraphSnapshot, removePlacementGraphSnapshot, upsertConnectorGraphSnapshot, upsertPlacementGraphSnapshot, useWorkspaceGraphSnapshot } from '../../crossBranch/store'
+import { loadWorkspaceGraphSnapshot, removeConnectorGraphSnapshot, removePlacementGraphSnapshot, upsertConnectorGraphSnapshot, upsertPlacementGraphSnapshot, useWorkspaceGraphSnapshot } from '../../crossBranch/store'
 import type { ProxyConnectorDetails } from '../../crossBranch/types'
 import { useDemoRevealViewport, type ViewEditorDemoOptions } from '../../demo/viewEditor'
 import { buildElementLibraryItems, useStore, placedElementToLibraryElement, resolveElementForUpdate } from '../../store/useStore'
@@ -786,6 +788,7 @@ function ViewEditorInner({
     const stored = localStorage.getItem('diag:libraryOpen')
     return stored !== null ? stored === 'true' : window.innerWidth >= 768
   })
+  const { flatPanels } = usePanelStyle()
   const [isExplorerOpen, setIsExplorerOpen] = useState(() => {
     if (typeof window === 'undefined') return false
     const stored = localStorage.getItem('diag:explorerOpen')
@@ -978,10 +981,12 @@ function ViewEditorInner({
 
   const handleSetActiveTags = useCallback((tags: string[]) => {
     setActiveTags(tags)
+    setHiddenLayerTags([])
   }, [])
 
   const handleSetHiddenLayerTags = useCallback((tags: string[]) => {
     setHiddenLayerTags(tags)
+    setActiveTags([])
   }, [])
 
   // stableOnConnectTo is wired after canvasInteractions is declared
@@ -1937,20 +1942,24 @@ function ViewEditorInner({
     return counts
   }, [viewElements, layers])
 
+  const toggleTagSelection = useCallback((tag: string) => {
+    const next = toggleSelectedTag(activeTagsRef.current, tag)
+    handleSetActiveTags(next.selectedTags)
+  }, [handleSetActiveTags])
+
+  const resetFilters = useCallback(() => {
+    const next = resetTagFilters()
+    setActiveTags(next.selectedTags)
+    setHiddenLayerTags(next.hiddenTags)
+  }, [])
+
   const toggleLayerVisibility = useCallback((layer: import('../../types').ViewLayer) => {
     if (layer.tags.length === 0) return
-    const prev = hiddenLayerTagsRef.current
-    const allHidden = layer.tags.every(t => prev.includes(t))
-    const next = allHidden
-      ? prev.filter(t => !layer.tags.includes(t))
-      : Array.from(new Set([...prev, ...layer.tags]))
-    handleSetHiddenLayerTags(next)
+    handleSetHiddenLayerTags(toggleHiddenTags(hiddenLayerTagsRef.current, layer.tags).hiddenTags)
   }, [handleSetHiddenLayerTags])
 
   const toggleTagVisibility = useCallback((tag: string) => {
-    const prev = hiddenLayerTagsRef.current
-    const next = prev.includes(tag) ? prev.filter(t => t !== tag) : [...prev, tag]
-    handleSetHiddenLayerTags(next)
+    handleSetHiddenLayerTags(toggleHiddenTags(hiddenLayerTagsRef.current, [tag]).hiddenTags)
   }, [handleSetHiddenLayerTags])
 
   // ── VS Code Integration ───────────────────────────────────────────────────
@@ -2025,8 +2034,8 @@ function ViewEditorInner({
 
   const effectiveWorkspaceSnapshot = useMemo(() => {
     if (viewId == null) return workspaceGraphSnapshot
-    return overrideViewContentInSnapshot(workspaceGraphSnapshot, viewId, viewElements, connectors)
-  }, [workspaceGraphSnapshot, viewId, viewElements, connectors])
+    return overrideViewContentInSnapshot(workspaceGraphSnapshot, viewId, viewElements, connectors, allElements)
+  }, [workspaceGraphSnapshot, viewId, viewElements, connectors, allElements])
 
   const placementSummaryByElementId = useMemo(() => {
     const summary: Record<number, string> = {}
@@ -2983,7 +2992,9 @@ function ViewEditorInner({
           allElements,
           existingElementIds,
           allowCreate: true,
-          getSecondaryLabel: pending.mode === 'connect'
+          connectionMode: pending.sourceElementIds.length > 0 ? pending.mode : undefined,
+          onConnectionModeChange: canvas.setPendingElementMode,
+          getSecondaryLabel: pending.sourceElementIds.length > 0
             ? (obj: WorkspaceElement) => placementSummaryByElementId[obj.id] ?? obj.technology ?? null
             : undefined,
           onConfirmNew: canvas.handleConfirmNewElement,
@@ -2998,6 +3009,7 @@ function ViewEditorInner({
     canvas.handleConfirmExistingElement,
     canvas.handleConfirmNewElement,
     canvas.pendingElement,
+    canvas.setPendingElementMode,
     existingElementIds,
     placementSummaryByElementId,
     viewId,
@@ -4015,9 +4027,14 @@ function ViewEditorInner({
         })
       }
 
-      await Promise.all(placementPlan.map((placement) =>
-        api.workspace.views.placements.add(targetViewId, placement.elementId, placement.x, placement.y)
-      ))
+      // Placement insertion copies related connectors. Serialize it so two
+      // endpoints cannot both copy the same relationship concurrently.
+      for (const placement of placementPlan) {
+        await api.workspace.views.placements.add(targetViewId, placement.elementId, placement.x, placement.y)
+      }
+      // View-scoped lists apply display filtering; compare stored relationships.
+      const existingConnectors = (await api.workspace.connectors.list(0)).filter((connector) => connector.view_id === targetViewId)
+      connectorPlan = planViewSelectionPasteConnectors({ ...payload, connectors: connectorPlan }, targetElementIdsBySourceId, existingConnectors)
       const createdConnectors = await Promise.all(connectorPlan.map((connector) =>
         api.workspace.connectors.create(targetViewId, {
           source_element_id: connector.sourceElementId,
@@ -4035,6 +4052,8 @@ function ViewEditorInner({
       ))
       createdConnectors.map(connectorToConnector).forEach(publishRealtimeConnectorUpsert)
 
+      await loadWorkspaceGraphSnapshot(true)
+      await refreshGrid()
       await refreshElements()
       pendingPasteSelectionRef.current = {
         viewId: targetViewId,
@@ -4052,11 +4071,11 @@ function ViewEditorInner({
       isPasteImportingRef.current = false
       setIsClipboardPasting(false)
     }
-  }, [canEdit, publishRealtimeConnectorUpsert, refreshElements, toast, autoLayoutMode, rfNodesRef])
+  }, [canEdit, publishRealtimeConnectorUpsert, refreshElements, refreshGrid, toast, autoLayoutMode, rfNodesRef])
 
   const handleCopyCutViewSelection = useCallback((event: ClipboardEvent) => {
     if (isEditableKeyboardTarget(event.target) || !isCanvasKeyboardTarget(event.target) || drawingMode || textEditorState || pendingElement) return
-    if (event.type === 'cut' && !canEdit) return
+    if (isPasteImportingRef.current || (event.type === 'cut' && !canEdit)) return
 
     const currentViewId = viewIdRef.current
     if (!currentViewId || !event.clipboardData) return
@@ -4074,13 +4093,38 @@ function ViewEditorInner({
     event.clipboardData.setData(VIEW_SELECTION_CLIPBOARD_MIME, serializeViewSelectionClipboardPayload(payload))
 
     if (event.type === 'cut') {
-      void handleBulkRemoveFromView()
+      const selectedIds = new Set(payload.elements.map((element) => element.elementId))
+      // Cut only internal relationships. Connections crossing the selection
+      // boundary remain valid off-view relationships in the source view.
+      const internalConnectors = connectors.filter((connector) => connector.view_id === currentViewId &&
+        selectedIds.has(connector.source_element_id) && selectedIds.has(connector.target_element_id))
+      isPasteImportingRef.current = true
+      void (async () => {
+        for (const connector of internalConnectors) {
+          await api.workspace.connectors.delete('', connector.id)
+          pushConnectorDeleteAction(connector)
+          removeConnectorGraphSnapshot(currentViewId, connector.id)
+          removeStoreConnector(connector.id)
+          publishRealtimeConnectorDelete(connector.id)
+        }
+        await handleBulkRemoveFromView()
+        await loadWorkspaceGraphSnapshot(true)
+        toast({ status: 'success', title: 'Selection cut' })
+      })().catch(async (err) => {
+        await refreshElements()
+        toast({ status: 'error', title: 'Cut failed', description: err instanceof Error ? err.message : String(err) })
+      }).finally(() => { isPasteImportingRef.current = false })
     }
   }, [
     canEdit,
     connectors,
     drawingMode,
     handleBulkRemoveFromView,
+    pushConnectorDeleteAction,
+    removeStoreConnector,
+    publishRealtimeConnectorDelete,
+    refreshElements,
+    toast,
     pendingElement,
     selectedCanvasElementIds,
     textEditorState,
@@ -4098,8 +4142,12 @@ function ViewEditorInner({
   }, [handleCopyCutViewSelection])
 
   const handlePasteFromClipboard = useCallback(async (event: ClipboardEvent) => {
-    if (!canEdit || isPasteImportingRef.current || textEditorState || pendingElement) return
+    if (!canEdit || textEditorState || pendingElement) return
     if (isEditableKeyboardTarget(event.target) || !isCanvasKeyboardTarget(event.target)) return
+    if (isPasteImportingRef.current) {
+      toast({ status: 'info', title: 'Clipboard operation is still finishing', description: 'Try pasting again when it completes.' })
+      return
+    }
 
     const clipboardData = event.clipboardData
     const customRaw = clipboardData?.getData(VIEW_SELECTION_CLIPBOARD_MIME) ?? ''
@@ -4259,9 +4307,9 @@ function ViewEditorInner({
       viewId, canEdit, isOwner, isFreePlan, snapToGrid, setSnapToGrid,
       autoLayoutMode, setAutoLayoutMode,
       selectedElement, selectedConnector: selectedEdge,
-      isMarkdownOpen, markdownPaneWidth
+      isMarkdownOpen, markdownPaneWidth, sidePanelStyle: flatPanels ? 'flat' : undefined
     }}>
-      <Box h="100%" display="flex" flexDir="column">
+      <Box data-testid="vieweditor-page" h="100%" minH={0} position="relative" overflow="hidden" display="flex" flexDir="column">
         <Flex ref={editorSplitRef} flex={1} overflow="hidden">
           <Box
             ref={containerRef}
@@ -4281,7 +4329,7 @@ function ViewEditorInner({
               <VStack
                 position="absolute"
                 top="50%"
-                left={libraryOpen ? '328px' : 3}
+                left={libraryOpen ? (flatPanels ? '312px' : '328px') : 3}
                 transform="translateY(-50%)"
                 spacing={1}
                 zIndex={1200}
@@ -4310,7 +4358,7 @@ function ViewEditorInner({
               <VStack
                 position="absolute"
                 top="50%"
-                right={isExplorerOpen ? '328px' : 3}
+                right={isExplorerOpen ? (flatPanels ? '312px' : '328px') : 3}
                 transform="translateY(-50%)"
                 spacing={1}
                 zIndex={5}
@@ -4424,31 +4472,6 @@ function ViewEditorInner({
                 </Box>
               )}
             </Box>
-
-            <ViewExplorer
-              treeNodes={treeData}
-              linksMap={linksMap} viewElements={viewElements}
-              onNavigate={canvas.stableOnNavigateToView}
-              onHoverZoom={handleExplorerHoverZoom}
-              isOpen={isExplorerOpen} onToggle={handleToggleExplorer}
-              isMobile={isMobileLayout}
-              activeTags={activeTags}
-              setActiveTags={handleSetActiveTags}
-              hiddenLayerTags={hiddenLayerTags}
-              setHiddenLayerTags={handleSetHiddenLayerTags}
-              availableTags={availableTags}
-              layers={layers}
-              onHoverLayer={handleHoverLayer}
-              onCreateLayer={handleCreateLayer}
-              onUpdateLayer={handleUpdateLayer}
-              onDeleteLayer={handleDeleteLayer}
-              tagColors={tagColors}
-              selectedElement={selectedElement}
-              onUpdateTags={handleUpdateTags}
-              onCreateTag={handleCreateTag}
-              suppressed={elementPanel.isOpen || connectorPanel.isOpen || viewDetails.isOpen}
-              noFocusLock={!!pendingElement || !!textEditorState}
-            />
 
             <EditorOverlays
               clickConnectMode={clickConnectMode}
@@ -4603,6 +4626,7 @@ function ViewEditorInner({
               name={viewName ?? undefined}
               isOpen={viewDetails.isOpen}
               onToggle={viewDetails.onToggle}
+              onOpenExplorer={viewId != null ? () => navigate(`/views?view=explore&focus=${viewId}`) : undefined}
               supportsZoomOut={supportsZoomOut}
               supportsZoomIn={supportsZoomIn}
             />
@@ -4636,6 +4660,9 @@ function ViewEditorInner({
               layers={layers}
               tagColors={tagColors}
               hiddenTags={hiddenLayerTags}
+              selectedTags={activeTags}
+              onToggleTagSelection={toggleTagSelection}
+              onResetTagFilters={resetFilters}
               toggleTagVisibility={toggleTagVisibility}
               toggleLayerVisibility={toggleLayerVisibility}
               tagCounts={tagCounts}
@@ -4717,6 +4744,31 @@ function ViewEditorInner({
             </>
           )}
         </Flex>
+
+        <ViewExplorer
+          treeNodes={treeData}
+          linksMap={linksMap} viewElements={viewElements}
+          onNavigate={canvas.stableOnNavigateToView}
+          onHoverZoom={handleExplorerHoverZoom}
+          isOpen={isExplorerOpen} onToggle={handleToggleExplorer}
+          isMobile={isMobileLayout}
+          activeTags={activeTags}
+          setActiveTags={handleSetActiveTags}
+          hiddenLayerTags={hiddenLayerTags}
+          setHiddenLayerTags={handleSetHiddenLayerTags}
+          availableTags={availableTags}
+          layers={layers}
+          onHoverLayer={handleHoverLayer}
+          onCreateLayer={handleCreateLayer}
+          onUpdateLayer={handleUpdateLayer}
+          onDeleteLayer={handleDeleteLayer}
+          tagColors={tagColors}
+          selectedElement={selectedElement}
+          onUpdateTags={handleUpdateTags}
+          onCreateTag={handleCreateTag}
+          suppressed={elementPanel.isOpen || connectorPanel.isOpen || viewDetails.isOpen}
+          noFocusLock={!!pendingElement || !!textEditorState}
+        />
 
         <ElementLibrary
           existingElementIds={existingElementIds}

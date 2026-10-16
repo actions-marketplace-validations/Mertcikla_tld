@@ -19,12 +19,13 @@ import {
   setHighlightColor as setRendererHighlightColor,
   setHighlightedTags as setRendererHighlightedTags,
   setHiddenTags as setRendererHiddenTags,
+  setTagColors as setRendererTagColors,
   setOnImageLoadCallback,
   getThemeVars,
   type RenderContext,
 } from './renderer'
 import { buildSceneGraph, type SceneGraph } from './sceneGraph'
-import type { ZUILayout, ZUIViewState } from './types'
+import type { HoveredItem, ZUILayout, ZUIViewState } from './types'
 import type { ZUIProxyConnectorState } from './useZUIProxyConnectors'
 import { subscribeElementNameFontsChanged } from '../../utils/elementName'
 
@@ -90,6 +91,8 @@ interface UseZUIRenderLoopArgs {
   highlightedTags?: string[]
   highlightColor?: string
   hiddenTags?: string[]
+  tagColors?: Record<string, { color?: string } | string>
+  hoveredItem?: HoveredItem | null
   groupLayers: ViewLayer[]
 }
 
@@ -109,8 +112,12 @@ export function useZUIRenderLoop({
   highlightedTags,
   highlightColor,
   hiddenTags,
+  tagColors,
   groupLayers,
+  hoveredItem = null,
 }: UseZUIRenderLoopArgs): ZUIRenderInvalidator {
+  const hoveredItemRef = useRef(hoveredItem)
+  hoveredItemRef.current = hoveredItem
   const needsRedrawRef = useRef(true)
   const labelBgRef = useRef('#171923')
   const accentRef = useRef('#63b3ed')
@@ -155,7 +162,7 @@ export function useZUIRenderLoop({
 
   useEffect(() => subscribeElementNameFontsChanged(invalidate), [invalidate])
 
-  useEffect(invalidate, [invalidate, viewState, crossBranchSettings])
+  useEffect(invalidate, [invalidate, viewState, crossBranchSettings, hoveredItem])
 
   useEffect(() => {
     sceneGraphRef.current = buildSceneGraph(layout)
@@ -288,6 +295,7 @@ export function useZUIRenderLoop({
         thresholds,
         lowDetail,
         groupLayersByDiagram,
+        hoveredItem: hoveredItemRef.current,
       }
 
       const occupiedLabelRects = renderFrame(ctx, graph, renderCtx, currentView, transitionRebaseRef.current)
@@ -320,6 +328,7 @@ export function useZUIRenderLoop({
         occupiedLabelRects,
         !lowDetail,
         rebasedViewport,
+        hoveredItemRef.current,
       )
       if (!lowDetail) {
         drawVisibleDirectProxyBadges(
@@ -367,12 +376,18 @@ export function useZUIRenderLoop({
     invalidate()
   }, [hiddenTags, invalidate])
 
+  useEffect(() => {
+    setRendererTagColors(tagColors ?? {})
+    invalidate()
+  }, [tagColors, invalidate])
+
 
   useEffect(() => {
     return () => {
       setRendererHighlightedTags(new Set())
       setRendererHighlightColor('')
       setRendererHiddenTags(new Set())
+      setRendererTagColors({})
     }
   }, [])
 

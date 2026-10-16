@@ -20,10 +20,11 @@ import {
   VStack,
 } from '@chakra-ui/react'
 import { ExternalLinkIcon } from '@chakra-ui/icons'
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import type { HoveredItem } from './types'
 import type { PathItem } from './camera'
+import { EDGE_CHANGE_META } from './edgeChange'
 
 const MAX_PROXY_HOVER_VIEW_LINKS = 5
 const BREADCRUMB_MAX_LABEL_WIDTH = 200
@@ -248,13 +249,27 @@ export function ZUIHoverPopover({
   hoveredScreenRect,
   isHoveredItemFullyVisible,
   onHoverLock,
+  onPopoverElement,
 }: {
   hoveredItem: HoveredItem | null
   hoveredScreenRect: { sx: number; sy: number; sw: number; sh: number } | null
   isHoveredItemFullyVisible: boolean
   onHoverLock: (locked: boolean) => void
+  onPopoverElement?: (element: HTMLElement | null) => void
 }) {
   const isOpen = isHoveredItemFullyVisible
+  const contentElementRef = useRef<HTMLElement | null>(null)
+  const isOpenRef = useRef(isOpen)
+  isOpenRef.current = isOpen
+  // Keep the ref callback stable across opening/closing: the motion component
+  // retains its initial forwarded ref. Report visibility separately.
+  const registerPopoverElement = useCallback((element: HTMLElement | null) => {
+    contentElementRef.current = element
+    onPopoverElement?.(isOpenRef.current ? element : null)
+  }, [onPopoverElement])
+  useLayoutEffect(() => {
+    onPopoverElement?.(isOpen ? contentElementRef.current : null)
+  }, [isOpen, onPopoverElement])
 
   useEffect(() => {
     if (!isOpen) onHoverLock(false)
@@ -264,13 +279,17 @@ export function ZUIHoverPopover({
   return (
     <Popover
       isOpen={isOpen}
-      placement="right-start"
+      placement={hoveredItem?.type === 'edge' ? 'bottom-start' : 'right-start'}
+      autoFocus={false}
+      returnFocusOnClose={false}
+      modifiers={[{ name: 'preventOverflow', options: { altAxis: true, padding: 8 } }]}
       closeOnBlur={false}
       gutter={12}
       isLazy
     >
       <PopoverTrigger>
         <Box
+          data-testid="zui-hover-anchor"
           position="absolute"
           left={hoveredScreenRect?.sx ?? 0}
           top={hoveredScreenRect?.sy ?? 0}
@@ -281,6 +300,7 @@ export function ZUIHoverPopover({
       </PopoverTrigger>
       <Portal>
         <PopoverContent
+          ref={registerPopoverElement}
           data-testid="zui-hover-popover"
           bg="glass.bg"
           border="1px solid"
@@ -429,8 +449,8 @@ export function ZUIHoverPopover({
                   <Divider borderColor="whiteAlpha.200" />
                   <HStack width="full" spacing={2}>
                     <Button
-                      as={hoveredItem.data.diagramId > 0 ? RouterLink : undefined}
-                    isDisabled={hoveredItem.data.diagramId < 0}
+                      as={(hoveredItem.data.details.connectors[0]?.source.anchorViewId ?? hoveredItem.data.diagramId) > 0 ? RouterLink : undefined}
+                      isDisabled={(hoveredItem.data.details.connectors[0]?.source.anchorViewId ?? hoveredItem.data.diagramId) < 0}
                       to={`/views/${hoveredItem.data.details!.connectors[0]?.source.anchorViewId ?? hoveredItem.data.diagramId}?element=${hoveredItem.data.sourceObjId}`}
                       size="xs"
                       colorScheme="gray"
@@ -442,8 +462,8 @@ export function ZUIHoverPopover({
                       Open Source
                     </Button>
                     <Button
-                      as={hoveredItem.data.diagramId > 0 ? RouterLink : undefined}
-                    isDisabled={hoveredItem.data.diagramId < 0}
+                      as={(hoveredItem.data.details.connectors[0]?.target.anchorViewId ?? hoveredItem.data.diagramId) > 0 ? RouterLink : undefined}
+                      isDisabled={(hoveredItem.data.details.connectors[0]?.target.anchorViewId ?? hoveredItem.data.diagramId) < 0}
                       to={`/views/${hoveredItem.data.details!.connectors[0]?.target.anchorViewId ?? hoveredItem.data.diagramId}?element=${hoveredItem.data.targetObjId}`}
                       size="xs"
                       colorScheme="teal"
@@ -469,6 +489,17 @@ export function ZUIHoverPopover({
                   <Badge colorScheme={hoveredItem.data.isPortalConn ? 'purple' : 'orange'} variant="subtle" fontSize="2xs">
                     {hoveredItem.data.isPortalConn ? 'Portal Connection' : 'Connection'}
                   </Badge>
+                  {hoveredItem.data.change && (
+                    <Badge
+                      data-testid="zui-edge-change"
+                      bg={EDGE_CHANGE_META[hoveredItem.data.change].color}
+                      color="black"
+                      variant="solid"
+                      fontSize="2xs"
+                    >
+                      {EDGE_CHANGE_META[hoveredItem.data.change].label}
+                    </Badge>
+                  )}
                 </VStack>
               </PopoverHeader>
               <PopoverBody px={4} py={3}>

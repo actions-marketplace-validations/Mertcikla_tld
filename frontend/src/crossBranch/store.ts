@@ -6,6 +6,7 @@ import type { WorkspaceGraphSnapshot } from './types'
 
 let cachedSnapshot: WorkspaceGraphSnapshot | null = null
 let inflightLoad: Promise<WorkspaceGraphSnapshot> | null = null
+let loadGeneration = 0
 const listeners = new Set<(snapshot: WorkspaceGraphSnapshot | null) => void>()
 
 function publish(snapshot: WorkspaceGraphSnapshot | null) {
@@ -20,13 +21,16 @@ export function primeWorkspaceGraphSnapshot(data: ExploreData) {
 export async function loadWorkspaceGraphSnapshot(force = false): Promise<WorkspaceGraphSnapshot> {
   if (!force && cachedSnapshot) return cachedSnapshot
   if (!force && inflightLoad) return inflightLoad
+  const generation = ++loadGeneration
   inflightLoad = api.explore.load().then((data) => {
     const snapshot = buildWorkspaceGraphSnapshot(data)
-    publish(snapshot)
-    inflightLoad = null
+    if (generation === loadGeneration) {
+      publish(snapshot)
+      inflightLoad = null
+    }
     return snapshot
   }).catch((error) => {
-    inflightLoad = null
+    if (generation === loadGeneration) inflightLoad = null
     throw error
   })
   return inflightLoad
@@ -54,8 +58,8 @@ export function useWorkspaceGraphSnapshot(enabled = true) {
   return snapshot
 }
 
-export function upsertConnectorGraphSnapshot(connector: Parameters<typeof upsertConnectorInSnapshot>[1]) {
-  publish(upsertConnectorInSnapshot(cachedSnapshot, connector))
+export function upsertConnectorGraphSnapshot(connector: Parameters<typeof upsertConnectorInSnapshot>[1], elements?: Parameters<typeof upsertConnectorInSnapshot>[2]) {
+  publish(upsertConnectorInSnapshot(cachedSnapshot, connector, elements))
 }
 
 export function removeConnectorGraphSnapshot(viewId: number, connectorId: number) {
