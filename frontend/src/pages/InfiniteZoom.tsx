@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
-import type { ReactNode, Ref } from 'react'
+import type { ReactNode, Ref, RefObject } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { Box, Center, Spinner, useDisclosure } from '@chakra-ui/react'
 import ExploreOnboarding from '../components/ExploreOnboarding'
@@ -9,11 +9,14 @@ import { useCrossBranchContextSettings } from '../crossBranch/settings'
 import { ExploreEmptyState, ExploreToolbar } from './explore/ExploreComponents'
 import { useExploreData, type ExploreDataState } from './explore/useExploreData'
 import { useExploreTags } from './explore/useExploreTags'
+import { parseNumericId } from '../utils/ids'
 
 interface Props {
+  breadcrumbBoundaryRef?: RefObject<HTMLDivElement>
   sharedToken?: string
   shareSlot?: ReactNode
   dataState?: ExploreDataState
+  initialOffViewConnectorsEnabled?: boolean
 }
 
 export interface InfiniteZoomHandle {
@@ -24,7 +27,7 @@ export interface InfiniteZoomHandle {
 
 const MINI_ONBOARDING_KEY = 'shared_zoom_onboarding_dismissed'
 
-function ExplorePage({ sharedToken, shareSlot, dataState }: Props, ref?: Ref<InfiniteZoomHandle>) {
+function ExplorePage({ sharedToken, shareSlot, dataState, initialOffViewConnectorsEnabled, breadcrumbBoundaryRef }: Props, ref?: Ref<InfiniteZoomHandle>) {
   const navigate = useNavigate()
   const location = useLocation()
   const zuiRef = useRef<ZUICanvasHandle>(null)
@@ -43,13 +46,22 @@ function ExplorePage({ sharedToken, shareSlot, dataState }: Props, ref?: Ref<Inf
     setConnectorBudget: setCrossBranchConnectorBudget,
     setConnectorPriority: setCrossBranchConnectorPriority,
   } = useCrossBranchContextSettings(crossBranchSurface)
+
+  useEffect(() => {
+    if (initialOffViewConnectorsEnabled !== undefined) {
+      setCrossBranchEnabled(initialOffViewConnectorsEnabled)
+    }
+  }, [initialOffViewConnectorsEnabled, setCrossBranchEnabled])
+
   const cameraProfile = useMemo(() => new URLSearchParams(location.search).get('profile'), [location.search])
+  const detailViewId = useMemo(() => parseNumericId(new URLSearchParams(location.search).get('detailView')), [location.search])
+  const overviewViewId = useMemo(() => parseNumericId(new URLSearchParams(location.search).get('overviewView')), [location.search])
   const isDetailToOverviewProfile = sharedToken && cameraProfile === 'detail-to-overview'
   const initialCameraFrame = useMemo<ZUICameraFrame | undefined>(() => {
     return isDetailToOverviewProfile
-      ? { profile: 'detail-to-overview', progress: 0 }
+      ? { profile: 'detail-to-overview', progress: 0, detailViewId: detailViewId ?? undefined, overviewViewId: overviewViewId ?? undefined }
       : undefined
-  }, [isDetailToOverviewProfile])
+  }, [detailViewId, isDetailToOverviewProfile, overviewViewId])
 
   useImperativeHandle(ref, () => ({
     focusDiagram(viewId: number) {
@@ -101,12 +113,12 @@ function ExplorePage({ sharedToken, shareSlot, dataState }: Props, ref?: Ref<Inf
       const progress = Number(payload.progress)
       if (!Number.isFinite(progress)) return
 
-      zuiRef.current?.setCameraFrame({ profile: 'detail-to-overview', progress })
+      zuiRef.current?.setCameraFrame({ profile: 'detail-to-overview', progress, detailViewId: detailViewId ?? undefined, overviewViewId: overviewViewId ?? undefined })
     }
 
     window.addEventListener('message', handleMessage)
     return () => window.removeEventListener('message', handleMessage)
-  }, [sharedToken])
+  }, [detailViewId, overviewViewId, sharedToken])
 
   const noDiagrams = !data || (data.tree ?? []).length === 0
   const goToEditor = useCallback(() => {
@@ -143,6 +155,7 @@ function ExplorePage({ sharedToken, shareSlot, dataState }: Props, ref?: Ref<Inf
       {data && (
         <>
           <ZUICanvas
+            breadcrumbBoundaryRef={breadcrumbBoundaryRef}
             ref={zuiRef}
             data={data}
             onReady={() => setCanvasReady(true)}
